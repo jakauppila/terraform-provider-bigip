@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"reflect"
@@ -29,10 +30,15 @@ import (
 
 var defaultConfigOptions = &ConfigOptions{
 	APICallTimeout: 60 * time.Second,
+	// Define new configuration options; are these user-override-able at the provider level or does that take more work?
+	TokenTimeout:   1200 * time.Second,
+	APICallRetries: 10,
 }
 
 type ConfigOptions struct {
 	APICallTimeout time.Duration
+	TokenTimeout   time.Duration
+	APICallRetries int
 }
 
 type Config struct {
@@ -66,6 +72,11 @@ type APIRequest struct {
 	URL         string
 	Body        string
 	ContentType string
+}
+
+type APIError struct {
+	Code    int
+	Message string
 }
 
 // Upload contains information about a file upload status
@@ -178,29 +189,45 @@ func NewTokenSession(bigipConfig *Config) (b *BigIP, err error) {
 		}
 		b.Transport.TLSClientConfig.RootCAs = rootCAs
 	}
-	resp, err := b.APICall(req)
-	if err != nil {
-		return
+
+	// Some of this retry logic might largely be unnecessary if we're already handling it within APICall itself
+	maxRetries := b.ConfigOptions.APICallRetries
+
+	// Retry the auth request if we get a 401/503 and an error that an asynchrnous task is executing
+	for i := 0; i < maxRetries; i++ {
+		resp, err := b.APICall(req)
+		if err != nil {
+			var apiErrorResp APIError
+			err = json.Unmarshal(resp, &apiErrorResp)
+			if err != nil {
+				return b, err
+			}
+
+			// There's likely more clear scenarios where we need to catch this, but for now, we'll just check for 401/503 and the error message
+			if (apiErrorResp.Code == 401 || apiErrorResp.Code == 503) && strings.Contains(strings.ToLower(apiErrorResp.Message), strings.ToLower("there is an active asynchronous task executing")) {
+				log.Printf("[INFO] There is an active asynchronous task executing while attempting to auth. Waiting 10 seconds and retrying %d of %d", i+1, maxRetries)
+				time.Sleep(10 * time.Second)
+				continue
+			} else {
+				err = fmt.Errorf("unable to acquire authentication token: %d -- %s", apiErrorResp.Code, apiErrorResp.Message)
+				return b, err
+			}
+		}
+
+		var aresp authResp
+		err = json.Unmarshal(resp, &aresp)
+		if err != nil {
+			return b, err
+		}
+
+		if aresp.Token.Token == "" {
+			err = fmt.Errorf("unable to acquire authentication token")
+			return b, err
+		}
+
+		b.Token = aresp.Token.Token
+		return b, nil
 	}
-
-	if resp == nil {
-		err = fmt.Errorf("unable to acquire authentication token")
-		return
-	}
-
-	var aresp authResp
-	err = json.Unmarshal(resp, &aresp)
-	if err != nil {
-		return
-	}
-
-	if aresp.Token.Token == "" {
-		err = fmt.Errorf("unable to acquire authentication token")
-		return
-	}
-
-	b.Token = aresp.Token.Token
-
 	return
 }
 
@@ -238,30 +265,50 @@ func (b *BigIP) APICall(options *APIRequest) ([]byte, error) {
 		req.SetBasicAuth(b.User, b.Password)
 	}
 
-	//fmt.Println("REQ -- ", options.Method, " ", url," -- ",options.Body)
-
+	// Use fmt.Println when debugging
+	//fmt.Println("REQ -- ", b.Token, options.Method, " ", url, " -- ", options.Body)
 	if len(options.ContentType) > 0 {
 		req.Header.Set("Content-Type", options.ContentType)
 	}
 
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
+	maxRetries := b.ConfigOptions.APICallRetries
 
-	defer res.Body.Close()
-
-	data, _ := ioutil.ReadAll(res.Body)
-
-	if res.StatusCode >= 400 {
-		if res.Header["Content-Type"][0] == "application/json" {
-			return data, b.checkError(data)
+	for i := 0; i < maxRetries; i++ {
+		// Log out the request when debugging
+		log.Printf("[INFO] REQ -- ", b.Token, options.Method, " ", url, " -- ", options.Body)
+		res, err := client.Do(req)
+		if err != nil {
+			return nil, err
 		}
+		defer res.Body.Close()
 
-		return data, errors.New(fmt.Sprintf("HTTP %d :: %s", res.StatusCode, string(data[:])))
+		data, _ := ioutil.ReadAll(res.Body)
+
+		// Log out the response when debugging
+		log.Printf("[INFO] HTTP %d :: %s", res.StatusCode, string(data[:]))
+
+		if res.StatusCode >= 400 {
+			var apiErrorResp APIError
+			err = json.Unmarshal(data, &apiErrorResp)
+			if err != nil {
+				return nil, err
+			}
+
+			// With how some of the requests come back from AS3, we sometimes have a nested error, so check the entire message for the "active asynchronous task" error
+			if res.StatusCode == 503 || apiErrorResp.Code == 503 || strings.Contains(strings.ToLower(apiErrorResp.Message), strings.ToLower("there is an active asynchronous task executing")) {
+				time.Sleep(10 * time.Second)
+				log.Printf("[INFO] encountered 503 error against %s, retrying %d of %d", options.URL, i+1, maxRetries)
+				continue
+			}
+			if res.Header["Content-Type"][0] == "application/json" {
+				return data, b.checkError(data)
+			}
+			return data, fmt.Errorf("HTTP %d :: %s", res.StatusCode, string(data[:]))
+		}
+		return data, nil
 	}
 
-	return data, nil
+	return nil, fmt.Errorf("service unavailable after %d attempts", maxRetries)
 }
 
 func (b *BigIP) iControlPath(parts []string) string {
@@ -295,6 +342,45 @@ func (b *BigIP) deleteReq(path ...string) ([]byte, error) {
 
 	resp, callErr := b.APICall(req)
 	return resp, callErr
+}
+
+// Purge Token function, though it's unclear if we can easily distinguish when the provider is generating it vs user-supplied, so not currently utilized
+func (b *BigIP) PurgeToken() error {
+
+	if b.Token != "" {
+		var tokenUri = fmt.Sprintf("mgmt/shared/authz/tokens/%s", b.Token)
+		fmt.Printf("[INFO] Purged token %s \n", b.Token)
+		req := &APIRequest{
+			Method: "delete",
+			URL:    tokenUri,
+		}
+
+		_, err := b.APICall(req)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	return nil
+}
+
+// Set Token Timeout to explicitly set token timeout value
+func (b *BigIP) SetTokenTimeout(timeout time.Duration) error {
+	var tokenUri = fmt.Sprintf("mgmt/shared/authz/tokens/%s", b.Token)
+	var timeoutBody = fmt.Sprintf(`{"timeout": %d}`, int(timeout.Seconds()))
+	req := &APIRequest{
+		Method:      "patch",
+		URL:         tokenUri,
+		Body:        timeoutBody,
+		ContentType: "application/json",
+	}
+
+	_, err := b.APICall(req)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *BigIP) deleteReqBody(body interface{}, path ...string) ([]byte, error) {

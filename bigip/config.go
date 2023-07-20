@@ -32,6 +32,16 @@ func Client(config *bigip.Config) (*bigip.BigIP, error) {
 			return nil, err
 		}
 
+		// If the TokenTimeout is a non-default value, 1200 seconds, set the token timeout
+		if config.ConfigOptions.TokenTimeout != 1200 {
+			err = client.SetTokenTimeout(config.ConfigOptions.TokenTimeout)
+			if err != nil {
+				log.Printf("[ERROR] Error setting token timeout %s ", err)
+				return nil, err
+			}
+			//fmt.Printf("[INFO] Token %s timeout set to %d \n", client.Token, int(config.ConfigOptions.TokenTimeout.Seconds()))
+			log.Printf("[INFO] Token %s timeout set to %d ", client.Token, int(config.ConfigOptions.TokenTimeout.Seconds()))
+		}
 	} else {
 		client = bigip.NewSession(config)
 		// The provider will use the Token value instead of the password
