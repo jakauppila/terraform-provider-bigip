@@ -74,11 +74,6 @@ type APIRequest struct {
 	ContentType string
 }
 
-type APIError struct {
-	Code    int
-	Message string
-}
-
 // Upload contains information about a file upload status
 type Upload struct {
 	RemainingByteCount int64          `json:"remainingByteCount"`
@@ -190,44 +185,29 @@ func NewTokenSession(bigipConfig *Config) (b *BigIP, err error) {
 		b.Transport.TLSClientConfig.RootCAs = rootCAs
 	}
 
-	// Some of this retry logic might largely be unnecessary if we're already handling it within APICall itself
-	maxRetries := b.ConfigOptions.APICallRetries
-
-	// Retry the auth request if we get a 401/503 and an error that an asynchrnous task is executing
-	for i := 0; i < maxRetries; i++ {
-		resp, err := b.APICall(req)
-		if err != nil {
-			var apiErrorResp APIError
-			err = json.Unmarshal(resp, &apiErrorResp)
-			if err != nil {
-				return b, err
-			}
-
-			// There's likely more clear scenarios where we need to catch this, but for now, we'll just check for 401/503 and the error message
-			if (apiErrorResp.Code == 401 || apiErrorResp.Code == 503) && strings.Contains(strings.ToLower(apiErrorResp.Message), strings.ToLower("there is an active asynchronous task executing")) {
-				log.Printf("[INFO] There is an active asynchronous task executing while attempting to auth. Waiting 10 seconds and retrying %d of %d", i+1, maxRetries)
-				time.Sleep(10 * time.Second)
-				continue
-			} else {
-				err = fmt.Errorf("unable to acquire authentication token: %d -- %s", apiErrorResp.Code, apiErrorResp.Message)
-				return b, err
-			}
-		}
-
-		var aresp authResp
-		err = json.Unmarshal(resp, &aresp)
-		if err != nil {
-			return b, err
-		}
-
-		if aresp.Token.Token == "" {
-			err = fmt.Errorf("unable to acquire authentication token")
-			return b, err
-		}
-
-		b.Token = aresp.Token.Token
-		return b, nil
+	resp, err := b.APICall(req)
+	if err != nil {
+		return
 	}
+
+	if resp == nil {
+		err = fmt.Errorf("unable to acquire authentication token")
+		return
+	}
+
+	var aresp authResp
+	err = json.Unmarshal(resp, &aresp)
+	if err != nil {
+		return
+	}
+
+	if aresp.Token.Token == "" {
+		err = fmt.Errorf("unable to acquire authentication token")
+		return
+	}
+
+	b.Token = aresp.Token.Token
+
 	return
 }
 
@@ -257,53 +237,63 @@ func (b *BigIP) APICall(options *APIRequest) ([]byte, error) {
 		format = "%s/mgmt/tm/%s"
 	}
 	url := fmt.Sprintf(format, b.Host, options.URL)
-	body := bytes.NewReader([]byte(options.Body))
-	req, _ = http.NewRequest(strings.ToUpper(options.Method), url, body)
-	if b.Token != "" {
-		req.Header.Set("X-F5-Auth-Token", b.Token)
-	} else if options.URL != "mgmt/shared/authn/login" {
-		req.SetBasicAuth(b.User, b.Password)
-	}
-
-	// Use fmt.Println when debugging
-	//fmt.Println("REQ -- ", b.Token, options.Method, " ", url, " -- ", options.Body)
-	if len(options.ContentType) > 0 {
-		req.Header.Set("Content-Type", options.ContentType)
-	}
 
 	maxRetries := b.ConfigOptions.APICallRetries
 
 	for i := 0; i < maxRetries; i++ {
+
+		body := bytes.NewReader([]byte(options.Body))
+		req, _ = http.NewRequest(strings.ToUpper(options.Method), url, body)
+		if b.Token != "" {
+			req.Header.Set("X-F5-Auth-Token", b.Token)
+		} else if options.URL != "mgmt/shared/authn/login" {
+			req.SetBasicAuth(b.User, b.Password)
+		}
+
+		// Use fmt.Println when debugging
+		//fmt.Println("REQ -- ", b.Token, options.Method, " ", url, " -- ", options.Body)
+		if len(options.ContentType) > 0 {
+			req.Header.Set("Content-Type", options.ContentType)
+		}
+
 		// Log out the request when debugging
 		log.Printf("[INFO] REQ -- ", b.Token, options.Method, " ", url, " -- ", options.Body)
 		res, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}
-		defer res.Body.Close()
 
 		data, _ := ioutil.ReadAll(res.Body)
+		res.Body.Close()
 
 		// Log out the response when debugging
-		log.Printf("[INFO] HTTP %d :: %s", res.StatusCode, string(data[:]))
+		log.Printf("[INFO] HTTP RESPONSE %d :: %s", res.StatusCode, string(data[:]))
+
+		contentType := ""
+		if ctHeaders, ok := res.Header["Content-Type"]; ok && len(ctHeaders) > 0 {
+			contentType = ctHeaders[0]
+			log.Printf("[INFO] CONTENT HEADER %s", contentType)
+		}
 
 		if res.StatusCode >= 400 {
-			var apiErrorResp APIError
-			err = json.Unmarshal(data, &apiErrorResp)
-			if err != nil {
-				return nil, err
-			}
+			if strings.Contains(contentType, "application/json") {
+				var reqError RequestError
+				err = json.Unmarshal(data, &reqError)
+				if err != nil {
+					return nil, err
+				}
 
-			// With how some of the requests come back from AS3, we sometimes have a nested error, so check the entire message for the "active asynchronous task" error
-			if res.StatusCode == 503 || apiErrorResp.Code == 503 || strings.Contains(strings.ToLower(apiErrorResp.Message), strings.ToLower("there is an active asynchronous task executing")) {
-				time.Sleep(10 * time.Second)
-				log.Printf("[INFO] encountered 503 error against %s, retrying %d of %d", options.URL, i+1, maxRetries)
-				continue
-			}
-			if res.Header["Content-Type"][0] == "application/json" {
+				// With how some of the requests come back from AS3, we sometimes have a nested error, so check the entire message for the "active asynchronous task" error
+				if res.StatusCode == 503 || reqError.Code == 503 || strings.Contains(strings.ToLower(reqError.Message), strings.ToLower("there is an active asynchronous task executing")) {
+					time.Sleep(10 * time.Second)
+					log.Printf("[INFO] encountered 503 error against %s, retrying %d of %d", options.URL, i+1, maxRetries)
+					continue
+				}
+
 				return data, b.checkError(data)
+			} else {
+				return data, fmt.Errorf("HTTP %d :: %s", res.StatusCode, string(data[:]))
 			}
-			return data, fmt.Errorf("HTTP %d :: %s", res.StatusCode, string(data[:]))
 		}
 		return data, nil
 	}
